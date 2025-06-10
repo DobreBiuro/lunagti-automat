@@ -50,11 +50,13 @@
 
             <div class="mt-8 sm:mx-auto sm:w-full sm:max-w-md">
                 <div class="bg-white py-8 px-4 shadow sm:rounded-lg sm:px-10">
+                    <!-- Poprawiony blok logowania Google -->
+                    <!-- WAŻNE: Upewnij się, że Client ID poniżej jest poprawny -->
                     <div id="g_id_onload"
-                         data-client_id="224351474213-lkll4cbi0taah4qvnk3l0r7ocus175vc.apps.googleusercontent.com" <!-- WAŻNE: Wklej tutaj swój Client ID ponownie -->
+                         data-client_id="224351474213-lkll4cbi0taah4qvnk3l0r7ocus175vc.apps.googleusercontent.com"
                          data-callback="handleCredentialResponse">
                     </div>
-                    <div class="g_id_signin" data-type="standard"></div>
+                    <div class="g_id_signin" data-type="standard" data-theme="outline" data-text="sign_in_with" data-shape="rectangular" data-logo_alignment="left"></div>
                 </div>
             </div>
         </div>
@@ -153,17 +155,17 @@
 
         function renderQueries() {
             if (!state.queries || state.queries.length === 0) {
-                ui.queriesList.innerHTML = `<p class="text-gray-500">Brak zapytań do wyświetlenia.</p>`;
+                ui.queriesList.innerHTML = `<div class="bg-white shadow-sm rounded-lg p-6 text-center"><p class="text-gray-500">Brak nowych zapytań do wyświetlenia.</p><p class="text-sm text-gray-400 mt-2">Gdy nowe zadania pojawią się w Nozbe, system przetworzy je automatycznie.</p></div>`;
                 return;
             }
             
             ui.queriesList.innerHTML = state.queries.map(q => `
-                <div class="bg-white shadow-sm rounded-lg p-4 cursor-pointer hover:bg-gray-50">
+                <div class="bg-white shadow-sm rounded-lg p-4 transition hover:shadow-md">
                     <div class="flex justify-between items-start">
                         <div>
-                            <p class="font-semibold text-indigo-600">${q.fromCity} -> ${q.toCity}</p>
-                            <p class="text-sm text-gray-500">Data: ${new Date(q.queryDate).toLocaleDateString('pl-PL')}</p>
-                            <p class="mt-2 text-gray-700">${q.content.substring(0, 150)}...</p>
+                            <p class="font-semibold text-indigo-600">${q.fromCity} &rarr; ${q.toCity}</p>
+                            <p class="text-sm text-gray-500">Data zapytania: ${new Date(q.queryDate).toLocaleDateString('pl-PL')}</p>
+                            <p class="mt-2 text-gray-800 whitespace-pre-wrap">${q.content.substring(0, 250)}...</p>
                         </div>
                         <div>
                             <span class="inline-flex items-center rounded-md px-2 py-1 text-xs font-medium ring-1 ring-inset ${
@@ -171,11 +173,11 @@
                             }">${q.status}</span>
                         </div>
                     </div>
-                    <div class="mt-4 border-t pt-4">
-                        <h4 class="font-semibold text-sm">Analiza AI</h4>
+                    <div class="mt-4 border-t pt-4 bg-gray-50 -m-4 p-4 rounded-b-lg">
+                        <h4 class="font-semibold text-sm text-gray-800">Analiza AI</h4>
                         <p class="text-sm text-gray-600 mt-1"><span class="font-medium">Sentyment:</span> ${q.analysis.sentiment || 'Brak'}</p>
-                        <p class="text-sm text-gray-600 mt-1"><span class="font-medium">Sugerowana cena:</span> ${q.analysis.priceSuggestion || 'Brak'}</p>
-                        <p class="text-sm text-gray-600 mt-2"><em>${q.analysis.agentSuggestion || ''}</em></p>
+                        <p class="text-sm text-gray-600 mt-1"><span class="font-medium">Sugerowana cena:</span> <span class="font-bold text-green-600">${q.analysis.priceSuggestion || 'Brak'}</span></p>
+                        <p class="text-sm text-gray-600 mt-2 italic"><strong>Sugestia dla agenta:</strong> "${q.analysis.agentSuggestion || ''}"</p>
                     </div>
                 </div>
             `).join('');
@@ -192,6 +194,7 @@
         async function apiCall(action, params = {}) {
             if (!state.google_token) {
                 showNotification('Błąd: Brak tokenu uwierzytelniającego.', 'error');
+                logout();
                 return;
             }
 
@@ -203,17 +206,24 @@
                 url.searchParams.append(key, params[key]);
             }
             
+            ui.loadingScreen.classList.remove('hidden');
             try {
                 const response = await fetch(url);
+                if(response.status === 403 || response.status === 401){
+                   throw new Error('Brak autoryzacji. Zaloguj się ponownie.');
+                }
                 const result = await response.json();
 
-                if (!response.ok || result.error) {
-                    throw new Error(result.error || 'Błąd serwera');
+                if (result.error) {
+                    throw new Error(result.error);
                 }
                 return result.data;
             } catch (error) {
                 console.error('API Call failed:', error);
-                showNotification(`Błąd komunikacji z serwerem: ${error.message}`, 'error');
+                showNotification(`Błąd: ${error.message}`, 'error');
+                logout();
+            } finally {
+                ui.loadingScreen.classList.add('hidden');
             }
         }
         
@@ -233,8 +243,7 @@
                 renderQueries();
                 showScreen(ui.mainApp);
             } else {
-                // Jeśli getUserData się nie powiedzie (np. nieautoryzowany użytkownik)
-                logout();
+                // apiCall obsłuży błąd i wylogowanie
             }
         }
 
@@ -248,6 +257,8 @@
             state.queries = [];
             state.google_token = null;
             localStorage.removeItem('google_token');
+            // Wywołuje odnowienie sesji Google, aby upewnić się, że wylogowanie jest kompletne
+            google.accounts.id.disableAutoSelect();
             showScreen(ui.loginScreen);
         }
 
@@ -264,8 +275,13 @@
         });
 
         function showNotification(message, type = 'info') {
-            // Prosta implementacja notyfikacji. Można rozbudować o ładniejszy wygląd.
-            alert(message);
+            const notification = document.createElement('div');
+            notification.className = `fixed top-5 right-5 p-4 rounded-lg shadow-lg text-white ${type === 'error' ? 'bg-red-500' : 'bg-blue-500'}`;
+            notification.textContent = message;
+            document.body.appendChild(notification);
+            setTimeout(() => {
+                notification.remove();
+            }, 5000);
         }
     </script>
 
