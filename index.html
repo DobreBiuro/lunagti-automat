@@ -1,289 +1,516 @@
-<!DOCTYPE html>
-<html lang="pl" class="h-full bg-gray-100">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Panel LUNAGTI</title>
-    <!-- Tailwind CSS -->
-    <script src="https://cdn.tailwindcss.com"></script>
-    <!-- Google Fonts -->
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <!-- Google Identity Services -->
-    <script src="https://accounts.google.com/gsi/client" async defer></script>
-    <style>
-        body { font-family: 'Inter', sans-serif; }
-        .spinner {
-            border: 4px solid rgba(0, 0, 0, 0.1);
-            width: 36px;
-            height: 36px;
-            border-radius: 50%;
-            border-left-color: #09f;
-            animation: spin 1s ease infinite;
+/**
+ * @OnlyCurrentDoc
+ *
+ * Główny plik skryptu dla automatyzacji LUNAGTI.com
+ * Zarządza komunikacją z API, analizą danych i obsługą frontendu.
+ */
+
+// =================================================================
+// KROK 1: KONFIGURACJA - Wklej tutaj swoje klucze i ID
+// =================================================================
+const CONFIG = {
+  // Wklej tutaj ID swojego Arkusza Google
+  // Przykład: '1i0dsPvRgC9O66Ua-NdYnhxWVqicu4g3wyrH6GogKQMY'
+  SPREADSHEET_ID: '1i0dsPvRgC9O66Ua-NdYnhxWVqicu4g3wyrH6GogKQMY',
+
+  // Wklej tutaj swój Token API z Nozbe
+  // Przykład: 'ac3d0dcbdfcd13e43f4fbf3ef3e05706'
+  NOZBE_API_TOKEN: 'ac3d0dcbdfcd13e43f4fbf3ef3e05706',
+
+  // Wklej tutaj ID projektu z Nozbe, z którego mają być pobierane zapytania
+  // Przykład: 'Al9xljSnWRtZ2eWA'
+  NOZBE_PROJECT_ID: 'Al9xljSnWRtZ2eWA',
+  
+  // Wklej tutaj ID Klienta (Client ID) z Google Cloud Console
+  // Przykład: '224351474213-lkll4cbi0taah4qvnk3l0r7ocus175vc.apps.googleusercontent.com'
+  GOOGLE_CLIENT_ID: '224351474213-lkll4cbi0taah4qvnk3l0r7ocus175vc.apps.googleusercontent.com',
+
+  // Nazwy Arkuszy - nie zmieniaj, jeśli trzymasz się schematu
+  SHEET_NAMES: {
+    CRM: 'CRM_Klienci',
+    QUERIES: 'Rejestr_Zapytan',
+    AI_ANALYSIS: 'Analiza_AI_Zapytan',
+    PAYMENTS: 'Historia_Cen_i_Platnosci',
+    SUPERVISOR: 'Nadzor_AI_Agentow',
+    LOGS: 'Ukryte_Logi_Systemowe',
+    USERS: 'Uzytkownicy'
+  },
+
+  // Domyślny agent, do którego będą przypisywane nowe zadania
+  DEFAULT_AGENT_EMAIL: 'mrcn85@gmail.com' // WAŻNE: Zmień na email pierwszego admina
+};
+
+
+// =================================================================
+// GŁÓWNA FUNKCJA WEB APP (Endpoint dla Frontendu)
+// =================================================================
+
+/**
+ * Obsługuje żądania GET i POST od aplikacji frontendowej.
+ * @param {object} e - Obiekt zdarzenia przekazany przez Apps Script.
+ * @returns {ContentService.TextOutput} - Odpowiedź JSON.
+ */
+function doGet(e) {
+  // Przekierowuje wszystkie żądania GET do wspólnego handlera.
+  return handleRequest(e);
+}
+function doPost(e) {
+  // Przekierowuje wszystkie żądania POST do wspólnego handlera.
+  return handleRequest(e);
+}
+
+
+function handleRequest(e) {
+  try {
+    const action = e.parameter.action;
+    let token;
+
+    // Obsługa tokenu z GET lub POST
+    if (e.postData && e.postData.contents) {
+        const body = JSON.parse(e.postData.contents);
+        token = body.token;
+    } else {
+        token = e.parameter.token;
+    }
+    
+    if (!action) {
+       return createJsonResponse({ error: 'Action parameter is missing.' }, 400);
+    }
+    
+    // Weryfikacja tokenu Google
+    const payload = verifyGoogleToken(token);
+    if (!payload) {
+      return createJsonResponse({ error: 'Invalid or expired token.' }, 401);
+    }
+    const userEmail = payload.email;
+
+    // Sprawdzenie roli użytkownika
+    const userRole = getUserRole(userEmail);
+    if (!userRole) {
+      logAction('Błąd logowania', 'Użytkownik', userEmail, 'LOGIN_FAIL', {error: 'Unauthorized user'}, 'Błąd', 'Nieautoryzowany użytkownik próbował uzyskać dostęp.');
+      return createJsonResponse({ error: 'Unauthorized user.' }, 403);
+    }
+    
+    logAction('Logowanie', 'Użytkownik', userEmail, 'LOGIN_SUCCESS', { role: userRole }, 'Sukces', `Pomyślnie zalogowano użytkownika o roli: ${userRole}`);
+
+    let responseData;
+    switch (action) {
+      case 'getUserData':
+        responseData = { user: { email: userEmail, role: userRole }, queries: getQueriesForUser(userEmail, userRole) };
+        break;
+      case 'getAdminData':
+        if (userRole !== 'Admin') return createJsonResponse({ error: 'Forbidden' }, 403);
+        responseData = { users: getAllUsers() };
+        break;
+      // Inne akcje będą dodane tutaj, np. updateUserRole, updateQueryStatus
+      default:
+        return createJsonResponse({ error: 'Invalid action.' }, 400);
+    }
+
+    return createJsonResponse({ success: true, data: responseData });
+
+  } catch (error) {
+    Logger.log(error);
+    logAction('Błąd krytyczny', 'System', 'N/A', 'CRITICAL_ERROR', { error: error.toString(), stack: error.stack }, 'Błąd', error.stack);
+    return createJsonResponse({ error: 'An internal server error occurred.', details: error.toString() }, 500);
+  }
+}
+
+
+/**
+ * Tworzy standardową odpowiedź JSON.
+ * @param {object} data - Obiekt do serializacji.
+ * @param {number} [statusCode=200] - Kod statusu HTTP.
+ * @returns {ContentService.TextOutput} - Obiekt odpowiedzi.
+ */
+function createJsonResponse(data, statusCode = 200) {
+    // Apps Script nie wspiera ustawiania kodów statusu, ale zostawiamy dla spójności
+    return ContentService.createTextOutput(JSON.stringify(data))
+        .setMimeType(ContentService.MimeType.JSON);
+}
+
+
+// =================================================================
+// UWIERZYTELNIANIE I AUTORYZACJA
+// =================================================================
+
+/**
+ * Weryfikuje token ID od Google.
+ * @param {string} token - Token JWT od Google.
+ * @returns {object|null} - Zdekodowany payload tokenu lub null.
+ */
+function verifyGoogleToken(token) {
+  try {
+    const response = UrlFetchApp.fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${token}`);
+    const payload = JSON.parse(response.getContentText());
+    
+    // Sprawdź, czy token został wydany dla Twojej aplikacji
+    if (payload.aud !== CONFIG.GOOGLE_CLIENT_ID) {
+      logAction('Błąd weryfikacji tokenu', 'System', 'N/A', 'TOKEN_VERIFY_FAIL', { error: 'Wrong audience' }, 'Błąd', `Token aud: ${payload.aud}`);
+      return null;
+    }
+    // Sprawdź czy token nie wygasł
+    if (new Date().getTime() / 1000 > payload.exp) {
+      logAction('Błąd weryfikacji tokenu', 'System', payload.email, 'TOKEN_EXPIRED', { error: 'Token expired' }, 'Błąd', `Token wygasł o ${new Date(payload.exp * 1000)}`);
+      return null;
+    }
+
+    return payload;
+  } catch (e) {
+    logAction('Błąd weryfikacji tokenu', 'System', 'N/A', 'TOKEN_VERIFY_FAIL', { error: e.toString() }, 'Błąd', e.stack);
+    return null;
+  }
+}
+
+/**
+ * Pobiera rolę użytkownika z arkusza Uzytkownicy.
+ * @param {string} email - Adres email użytkownika.
+ * @returns {string|null} - Rola użytkownika (np. 'Admin', 'Agent') lub null.
+ */
+function getUserRole(email) {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(CONFIG.SHEET_NAMES.USERS);
+  if (!sheet) return null;
+
+  const data = sheet.getDataRange().getValues();
+  // Pomijamy nagłówek, zaczynając od i = 1
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][0] && data[i][0].toLowerCase() === email.toLowerCase()) {
+      return data[i][1]; // Zwraca rolę z drugiej kolumny
+    }
+  }
+  return null;
+}
+
+// =================================================================
+// GŁÓWNA LOGIKA AUTOMATYZACJI (do uruchamiania cyklicznego)
+// =================================================================
+
+/**
+ * Główna funkcja do cyklicznego uruchamiania.
+ * Pobiera nowe zadania z Nozbe i je przetwarza.
+ */
+function processNewNozbeTasks() {
+  logAction('Start cyklu', 'Skrypt', 'processNewNozbeTasks', 'JOB_START', {}, 'Sukces', 'Rozpoczęto przetwarzanie zadań z Nozbe.');
+  
+  try {
+    const tasks = getNewTasksFromNozbe();
+    
+    if (tasks && tasks.length > 0) {
+      logAction('Pobrano zadania', 'Skrypt', 'processNewNozbeTasks', 'FETCH_NOZBE_SUCCESS', { count: tasks.length }, 'Sukces', `Pobrano ${tasks.length} nowych zadań.`);
+      
+      tasks.forEach(task => {
+        // Sprawdź czy zadanie nie zostało już przetworzone
+        if(!isTaskAlreadyProcessed(task.id)) {
+          processSingleTask(task);
+        } else {
+          logAction('Pominięto zadanie', 'Skrypt', 'processNewNozbeTasks', 'TASK_SKIPPED_DUPLICATE', { taskId: task.id }, 'Informacja', `Zadanie ${task.id} już istnieje w bazie.`);
         }
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
+      });
+
+    } else {
+      logAction('Brak zadań', 'Skrypt', 'processNewNozbeTasks', 'FETCH_NOZBE_EMPTY', {}, 'Informacja', 'Nie znaleziono nowych zadań do przetworzenia.');
+    }
+    
+  } catch (error) {
+    Logger.log(error);
+    logAction('Błąd cyklu', 'Skrypt', 'processNewNozbeTasks', 'JOB_FAIL', { error: error.toString() }, 'Błąd', error.stack);
+  }
+  
+  logAction('Koniec cyklu', 'Skrypt', 'processNewNozbeTasks', 'JOB_END', {}, 'Sukces', 'Zakończono przetwarzanie zadań z Nozbe.');
+}
+
+
+/**
+ * Pobiera zadania z API Nozbe.
+ * @returns {Array|null} - Tablica obiektów zadań lub null.
+ */
+function getNewTasksFromNozbe() {
+  const url = `https://api4.nozbe.com/v1/api/project_tasks?project_id=${CONFIG.NOZBE_PROJECT_ID}`; // Usunięto active=true, aby pobrać wszystkie
+  const options = {
+    'method': 'get',
+    'headers': {
+      'Authorization': `Bearer ${CONFIG.NOZBE_API_TOKEN}`
+    },
+    'muteHttpExceptions': true
+  };
+
+  const response = UrlFetchApp.fetch(url, options);
+  if (response.getResponseCode() === 200) {
+    return JSON.parse(response.getContentText());
+  } else {
+    logAction('Błąd API Nozbe', 'Skrypt', 'getNewTasksFromNozbe', 'NOZBE_API_ERROR', { code: response.getResponseCode(), response: response.getContentText() }, 'Błąd', 'Nie udało się pobrać zadań.');
+    return null;
+  }
+}
+
+/**
+ * Przetwarza pojedyncze zadanie z Nozbe.
+ * @param {object} task - Obiekt zadania.
+ */
+function processSingleTask(task) {
+  try {
+    const queryContent = task.name + '\n' + (task.note?.body || ''); // Poprawka na strukturę notatki w API v4
+    
+    const extractedData = extractDataFromText(queryContent);
+    const aiAnalysis = performAiAnalysis(queryContent, extractedData);
+    saveDataToSheets(task, extractedData, aiAnalysis);
+    
+    // Zamiast archiwizować, dodajmy komentarz w Nozbe, że zadanie zostało przetworzone
+    addCommentToNozbeTask(task.id, `Zadanie zostało automatycznie przetworzone i dodane do panelu LUNAGTI o ${new Date().toLocaleString('pl-PL')}.`);
+
+    logAction('Przetworzono zadanie', 'Skrypt', 'processSingleTask', 'TASK_PROCESSED_SUCCESS', { taskId: task.id }, 'Sukces', `Zadanie ${task.id} zostało pomyślnie przetworzone.`);
+
+  } catch (error) {
+    Logger.log(`Błąd przetwarzania zadania ${task.id}: ${error}`);
+    logAction('Błąd przetwarzania zadania', 'Skrypt', 'processSingleTask', 'TASK_PROCESS_FAIL', { taskId: task.id, error: error.toString() }, 'Błąd', error.stack);
+  }
+}
+
+/**
+ * Prosta ekstrakcja danych z tekstu.
+ * @param {string} text - Treść zapytania.
+ * @returns {object} - Obiekt z wyekstrahowanymi danymi.
+ */
+function extractDataFromText(text) {
+    const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
+    const phoneRegex = /(?:\+?48)?\s?(\d{3}[-.\s]?\d{3}[-.\s]?\d{3}|\d{9})/;
+    
+    const emailMatch = text.match(emailRegex);
+    const phoneMatch = text.match(phoneRegex);
+
+    return {
+        email: emailMatch ? emailMatch[0] : null,
+        phone: phoneMatch ? phoneMatch[0].replace(/\s|-/g, '') : null,
+        fromCity: text.match(/z miasta: ([\w\s-]+)/i) ? text.match(/z miasta: ([\w\s-]+)/i)[1].trim() : 'Nie podano',
+        toCity: text.match(/do miasta: ([\w\s-]+)/i) ? text.match(/do miasta: ([\w\s-]+)/i)[1].trim() : 'Nie podano'
+    };
+}
+
+
+/**
+ * Symuluje analizę AI.
+ * @param {string} queryContent - Pełna treść zapytania.
+ * @param {object} extractedData - Wstępnie wyekstrahowane dane.
+ * @returns {object} - Wynik analizy AI.
+ */
+function performAiAnalysis(queryContent, extractedData) {
+    let sentiment = 'Neutralny';
+    if (queryContent.toLowerCase().includes('pilne') || queryContent.toLowerCase().includes('natychmiast')) sentiment = 'Pilny';
+    else if (queryContent.toLowerCase().includes('dziękuję') || queryContent.toLowerCase().includes('super')) sentiment = 'Pozytywny';
+    else if (queryContent.toLowerCase().includes('problem') || queryContent.toLowerCase().includes('źle')) sentiment = 'Negatywny';
+    
+    const socialMediaLinks = extractedData.email ? JSON.stringify([
+      { platform: "LinkedIn", url: `https://linkedin.com/search/results/all/?keywords=${encodeURIComponent(extractedData.email)}`},
+      { platform: "Facebook", url: `https://facebook.com/search/top/?q=${encodeURIComponent(extractedData.email)}`}
+    ]) : JSON.stringify([]);
+
+    return {
+        sentiment: sentiment,
+        priceSuggestion: '180-220 PLN',
+        priceJustification: `Na podstawie podobnych zapytań z miasta ${extractedData.fromCity}.`,
+        agentSuggestion: 'Bądź uprzejmy, potwierdź wszystkie szczegóły (data, godzina, liczba osób) i przedstaw sugerowaną cenę. Zaproponuj dodatkowy komfort jako opcję upsell.',
+        potentialUpsell: queryContent.toLowerCase().includes('bagaż') || queryContent.toLowerCase().includes('więcej miejsca'),
+        urgency: sentiment === 'Pilny' ? 'Wysoki' : 'Średni',
+        leadQuality: 7,
+        competitors: JSON.stringify([]),
+        agentMotivator: 'Kolejna szansa na świetną sprzedaż! Zamień to zapytanie w zadowolonego klienta!',
+        socialMediaLinks: socialMediaLinks
+    };
+}
+
+
+/**
+ * Zapisuje wszystkie zebrane dane do odpowiednich arkuszy.
+ * @param {object} task - Oryginalne zadanie z Nozbe.
+ * @param {object} extractedData - Dane po ekstrakcji.
+ * @param {object} aiAnalysis - Dane po analizie AI.
+ */
+function saveDataToSheets(task, extractedData, aiAnalysis) {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const crmSheet = ss.getSheetByName(CONFIG.SHEET_NAMES.CRM);
+  let customerId;
+  const customerEmail = extractedData.email || `nieznany_${task.id}@lunagti.com`; // Użyj ID zadania, jeśli emaila nie ma
+
+  let customerData = findRowByValue(crmSheet, 3, customerEmail); // Kolumna 3 to Email
+  
+  if (customerData) {
+    customerId = customerData.values[0];
+    const rowIndex = customerData.rowIndex;
+    crmSheet.getRange(rowIndex, 5, 1, 6).setValues([
+      ['Powracający', aiAnalysis.sentiment, aiAnalysis.socialMediaLinks, parseInt(customerData.values[7] || 0) + 1, customerData.values[8], new Date()]
+    ]);
+  } else {
+    customerId = Utilities.getUuid();
+    crmSheet.appendRow([
+        customerId, task.author?.name || 'Nieznany', customerEmail, extractedData.phone,
+        'Nowy', aiAnalysis.sentiment, aiAnalysis.socialMediaLinks, 1, 0, new Date(), new Date()
+    ]);
+  }
+
+  const queriesSheet = ss.getSheetByName(CONFIG.SHEET_NAMES.QUERIES);
+  const queryId = task.id; // Używamy ID z Nozbe jako unikalnego ID zapytania
+  queriesSheet.appendRow([
+    queryId, customerId, new Date(task.created_at), 'Nozbe', task.name + '\n' + (task.note?.body || ''),
+    extractedData.fromCity, 'Nie podano', extractedData.toCity, 'Nie podano', 'Nie podano', 1, '', 'Nowe', CONFIG.DEFAULT_AGENT_EMAIL
+  ]);
+
+  const aiSheet = ss.getSheetByName(CONFIG.SHEET_NAMES.AI_ANALYSIS);
+  aiSheet.appendRow([
+    Utilities.getUuid(), queryId, aiAnalysis.sentiment, aiAnalysis.priceSuggestion, aiAnalysis.priceJustification,
+    aiAnalysis.agentSuggestion, aiAnalysis.potentialUpsell, aiAnalysis.urgency, aiAnalysis.leadQuality,
+    aiAnalysis.competitors, aiAnalysis.agentMotivator
+  ]);
+
+  logAction('Zapis danych', 'Skrypt', 'saveDataToSheets', 'WRITE_SHEET_SUCCESS', { queryId: queryId }, 'Sukces', `Zapisano dane dla zapytania ${queryId}.`);
+}
+
+/**
+ * Sprawdza, czy zadanie o danym ID już istnieje w arkuszu Rejestr_Zapytan
+ * @param {string} taskId - ID zadania z Nozbe.
+ * @returns {boolean} - true jeśli zadanie istnieje, false w przeciwnym razie.
+ */
+function isTaskAlreadyProcessed(taskId) {
+    const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    const sheet = ss.getSheetByName(CONFIG.SHEET_NAMES.QUERIES);
+    return findRowByValue(sheet, 1, taskId) !== null;
+}
+
+/**
+ * Dodaje komentarz do zadania w Nozbe.
+ * @param {string} taskId - ID zadania.
+ * @param {string} commentBody - Treść komentarza.
+ */
+function addCommentToNozbeTask(taskId, commentBody) {
+    const url = "https://api4.nozbe.com/v1/api/comments";
+    const payload = {
+        task_id: taskId,
+        body: commentBody
+    };
+    const options = {
+        'method': 'post',
+        'contentType': 'application/json',
+        'headers': {
+            'Authorization': `Bearer ${CONFIG.NOZBE_API_TOKEN}`
+        },
+        'payload': JSON.stringify(payload),
+        'muteHttpExceptions': true
+    };
+    const response = UrlFetchApp.fetch(url, options);
+    if (response.getResponseCode() !== 201) {
+        logAction('Błąd dodawania komentarza Nozbe', 'Skrypt', 'addCommentToNozbeTask', 'NOZBE_API_ERROR', { taskId: taskId, error: response.getContentText() }, 'Błąd', `Nie udało się dodać komentarza do zadania ${taskId}.`);
+    }
+}
+
+
+// =================================================================
+// FUNKCJE POMOCNICZE DO OBSŁUGI ARKUSZA
+// =================================================================
+
+function logAction(action, actorType, actorId, actionCode, inputData, result, message) {
+  try {
+    const sheet = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID).getSheetByName(CONFIG.SHEET_NAMES.LOGS);
+    if (sheet) {
+        sheet.appendRow([new Date(), actorType, actorId, actionCode, '', action, JSON.stringify(inputData), result, message]);
+    }
+  } catch (e) {
+    Logger.log(`Błąd podczas logowania akcji: ${e}`);
+  }
+}
+
+function findRowByValue(sheet, colIndex, value) {
+    if (!value) return null;
+    const data = sheet.getDataRange().getValues();
+    for (let i = 1; i < data.length; i++) {
+        if (data[i][colIndex - 1] && data[i][colIndex - 1].toString().toLowerCase() === value.toString().toLowerCase()) {
+            return { rowIndex: i + 1, values: data[i] };
         }
-    </style>
-</head>
-<body class="h-full">
-    <div id="app" class="min-h-full">
-        
-        <!-- Ekran ładowania -->
-        <div id="loading-screen" class="fixed inset-0 bg-gray-100 flex items-center justify-center z-50">
-            <div class="text-center">
-                <div class="spinner mx-auto"></div>
-                <p class="mt-4 text-gray-600">Ładowanie...</p>
-            </div>
-        </div>
+    }
+    return null;
+}
 
-        <!-- Ekran logowania -->
-        <div id="login-screen" class="hidden min-h-full flex-col justify-center py-12 sm:px-6 lg:px-8">
-            <div class="sm:mx-auto sm:w-full sm:max-w-md">
-                <svg class="mx-auto h-12 w-auto text-indigo-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
-                    <path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                </svg>
-                <h2 class="mt-6 text-center text-3xl font-bold tracking-tight text-gray-900">Zaloguj się do panelu LUNAGTI</h2>
-            </div>
+// =================================================================
+// FUNKCJE WYWOŁYWANE PRZEZ FRONTEND
+// =================================================================
 
-            <div class="mt-8 sm:mx-auto sm:w-full sm:max-w-md">
-                <div class="bg-white py-8 px-4 shadow sm:rounded-lg sm:px-10">
-                    <!-- Poprawiony blok logowania Google -->
-                    <!-- WAŻNE: Upewnij się, że Client ID poniżej jest poprawny -->
-                    <div id="g_id_onload"
-                         data-client_id="224351474213-lkll4cbi0taah4qvnk3l0r7ocus175vc.apps.googleusercontent.com"
-                         data-callback="handleCredentialResponse">
-                    </div>
-                    <div class="g_id_signin" data-type="standard" data-theme="outline" data-text="sign_in_with" data-shape="rectangular" data-logo_alignment="left"></div>
-                </div>
-            </div>
-        </div>
+function getQueriesForUser(userEmail, userRole) {
+  try {
+    const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    const queriesSheet = ss.getSheetByName(CONFIG.SHEET_NAMES.QUERIES);
+    const analysisSheet = ss.getSheetByName(CONFIG.SHEET_NAMES.AI_ANALYSIS);
 
-        <!-- Główny interfejs aplikacji -->
-        <div id="main-app" class="hidden">
-            <nav class="bg-gray-800">
-                <div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
-                    <div class="flex h-16 items-center justify-between">
-                        <div class="flex items-center">
-                            <div class="flex-shrink-0">
-                                <svg class="h-8 w-8 text-indigo-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
-                                  <path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                                </svg>
-                            </div>
-                            <div class="hidden md:block">
-                                <div class="ml-10 flex items-baseline space-x-4">
-                                    <a href="#" id="nav-dashboard" class="bg-gray-900 text-white rounded-md px-3 py-2 text-sm font-medium">Panel Główny</a>
-                                    <a href="#" id="nav-admin" class="hidden text-gray-300 hover:bg-gray-700 hover:text-white rounded-md px-3 py-2 text-sm font-medium">Admin</a>
-                                    <a href="#" id="nav-supervisor" class="hidden text-gray-300 hover:bg-gray-700 hover:text-white rounded-md px-3 py-2 text-sm font-medium">Nadzór</a>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="hidden md:block">
-                            <div class="ml-4 flex items-center md:ml-6">
-                                <span id="user-email" class="text-gray-400 text-sm mr-3"></span>
-                                <button type="button" id="logout-button" class="rounded-full bg-gray-800 p-1 text-gray-400 hover:text-white focus:outline-none focus:ring-2 focus:ring-white focus:ring-offset-2 focus:ring-offset-gray-800">
-                                    <span class="sr-only">Wyloguj</span>
-                                    <svg class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" aria-hidden="true">
-                                        <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15m3 0l3-3m0 0l-3-3m3 3H9" />
-                                    </svg>
-                                </button>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </nav>
+    // --- Defensive checks START ---
+    if (!queriesSheet) {
+      logAction('Błąd krytyczny', 'System', 'getQueriesForUser', 'SHEET_NOT_FOUND', { sheetName: CONFIG.SHEET_NAMES.QUERIES }, 'Błąd', 'Nie znaleziono arkusza zapytań.');
+      return []; // Zwróć pustą tablicę, jeśli arkusz nie istnieje
+    }
+    if (!analysisSheet) {
+      logAction('Błąd krytyczny', 'System', 'getQueriesForUser', 'SHEET_NOT_FOUND', { sheetName: CONFIG.SHEET_NAMES.AI_ANALYSIS }, 'Błąd', 'Nie znaleziono arkusza analizy.');
+      // Możemy kontynuować bez analizy, ale na razie bądźmy rygorystyczni
+      return [];
+    }
+    // --- Defensive checks END ---
 
-            <header class="bg-white shadow">
-                <div class="mx-auto max-w-7xl py-6 px-4 sm:px-6 lg:px-8">
-                    <h1 id="header-title" class="text-3xl font-bold tracking-tight text-gray-900">Panel Główny</h1>
-                </div>
-            </header>
 
-            <main>
-                <div class="mx-auto max-w-7xl py-6 sm:px-6 lg:px-8">
-                    <!-- Dashboard View -->
-                    <div id="dashboard-view">
-                        <h2 class="text-xl font-semibold mb-4">Twoje nowe zapytania</h2>
-                        <div id="queries-list" class="space-y-4">
-                            <!-- Zapytania będą renderowane tutaj -->
-                        </div>
-                    </div>
-                    <!-- Admin View -->
-                    <div id="admin-view" class="hidden">
-                        <h2 class="text-xl font-semibold mb-4">Zarządzanie Użytkownikami</h2>
-                        <!-- Panel Admina -->
-                    </div>
-                     <!-- Supervisor View -->
-                    <div id="supervisor-view" class="hidden">
-                        <h2 class="text-xl font-semibold mb-4">Panel Nadzoru</h2>
-                         <!-- Panel Supervisora -->
-                    </div>
-                </div>
-            </main>
-        </div>
+    const queriesData = queriesSheet.getDataRange().getValues();
+    const analysisData = analysisSheet.getDataRange().getValues();
+    
+    // Zwróć pustą tablicę, jeśli nie ma danych (lub tylko nagłówki)
+    if (queriesData.length <= 1) {
+        return [];
+    }
 
-    </div>
-
-    <script>
-        const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwwHq5Yzyf58kpXZx3BFJzX3MDRApNzgrUnIZRGiWae7QSIegk2W3zXQWlkj7vvSBXt/exec'; // WAŻNE: Wklej tutaj URL wdrożonego skryptu Web App
-        const state = {
-            user: null,
-            queries: [],
-            google_token: null,
-        };
-
-        // --- OBSŁUGA UI ---
-        const ui = {
-            loadingScreen: document.getElementById('loading-screen'),
-            loginScreen: document.getElementById('login-screen'),
-            mainApp: document.getElementById('main-app'),
-            userEmail: document.getElementById('user-email'),
-            queriesList: document.getElementById('queries-list'),
-            headerTitle: document.getElementById('header-title'),
-            navAdmin: document.getElementById('nav-admin'),
-            logoutButton: document.getElementById('logout-button'),
-        };
-
-        function showScreen(screen) {
-            ui.loadingScreen.classList.add('hidden');
-            ui.loginScreen.classList.add('hidden');
-            ui.mainApp.classList.add('hidden');
-            if(screen) screen.classList.remove('hidden');
+    // Utwórz mapę z danymi analitycznymi, obsługuj, jeśli jest pusta
+    const analysisMap = new Map();
+    if (analysisData.length > 1) {
+      analysisData.slice(1).forEach(row => {
+        if(row && row[1]) { // Upewnij się, że wiersz i klucz istnieją
+           analysisMap.set(row[1], row);
         }
+      });
+    }
 
-        function renderQueries() {
-            if (!state.queries || state.queries.length === 0) {
-                ui.queriesList.innerHTML = `<div class="bg-white shadow-sm rounded-lg p-6 text-center"><p class="text-gray-500">Brak nowych zapytań do wyświetlenia.</p><p class="text-sm text-gray-400 mt-2">Gdy nowe zadania pojawią się w Nozbe, system przetworzy je automatycznie.</p></div>`;
-                return;
-            }
-            
-            ui.queriesList.innerHTML = state.queries.map(q => `
-                <div class="bg-white shadow-sm rounded-lg p-4 transition hover:shadow-md">
-                    <div class="flex justify-between items-start">
-                        <div>
-                            <p class="font-semibold text-indigo-600">${q.fromCity} &rarr; ${q.toCity}</p>
-                            <p class="text-sm text-gray-500">Data zapytania: ${new Date(q.queryDate).toLocaleDateString('pl-PL')}</p>
-                            <p class="mt-2 text-gray-800 whitespace-pre-wrap">${q.content.substring(0, 250)}...</p>
-                        </div>
-                        <div>
-                            <span class="inline-flex items-center rounded-md px-2 py-1 text-xs font-medium ring-1 ring-inset ${
-                                q.status === 'Nowe' ? 'bg-blue-50 text-blue-700 ring-blue-600/20' : 'bg-green-50 text-green-700 ring-green-600/20'
-                            }">${q.status}</span>
-                        </div>
-                    </div>
-                    <div class="mt-4 border-t pt-4 bg-gray-50 -m-4 p-4 rounded-b-lg">
-                        <h4 class="font-semibold text-sm text-gray-800">Analiza AI</h4>
-                        <p class="text-sm text-gray-600 mt-1"><span class="font-medium">Sentyment:</span> ${q.analysis.sentiment || 'Brak'}</p>
-                        <p class="text-sm text-gray-600 mt-1"><span class="font-medium">Sugerowana cena:</span> <span class="font-bold text-green-600">${q.analysis.priceSuggestion || 'Brak'}</span></p>
-                        <p class="text-sm text-gray-600 mt-2 italic"><strong>Sugestia dla agenta:</strong> "${q.analysis.agentSuggestion || ''}"</p>
-                    </div>
-                </div>
-            `).join('');
+    const allQueries = queriesData.slice(1).map(qRow => {
+      // Upewnij się, że qRow jest prawidłową tablicą o oczekiwanej długości
+      if (!qRow || qRow.length < 14) return null; 
+
+      const queryId = qRow[0];
+      const analysis = analysisMap.get(queryId) || [];
+      return {
+        queryId: queryId, customerId: qRow[1], queryDate: qRow[2], source: qRow[3],
+        content: qRow[4], fromCity: qRow[5], toCity: qRow[7], status: qRow[12], assignedAgent: qRow[13],
+        analysis: {
+          sentiment: analysis[2] || 'N/A', 
+          priceSuggestion: analysis[3] || 'N/A', 
+          agentSuggestion: analysis[5] || 'Brak sugestii.'
         }
-        
-        function setupUIForRole(role) {
-            if(role === 'Admin') {
-                ui.navAdmin.classList.remove('hidden');
-            }
-            // Dodaj logikę dla Supervisora
-        }
+      };
+    }).filter(q => q !== null) // Usuń wszystkie wpisy null z nieudanego mapowania
+      .sort((a, b) => {
+          const dateA = new Date(a.queryDate);
+          const dateB = new Date(b.queryDate);
+          // Sprawdź, czy daty są prawidłowe. Nieprawidłowe daty przesuwaj na koniec.
+          if (isNaN(dateA.getTime())) return 1;
+          if (isNaN(dateB.getTime())) return -1;
+          return dateB - dateA; // Sortuj malejąco (od najnowszych)
+    });
+    
+    if (userRole === 'Admin' || userRole === 'Supervisor') return allQueries;
+    if (userRole === 'Agent') return allQueries.filter(q => q.assignedAgent === userEmail);
+    return [];
 
-        // --- LOGIKA APLIKACJI ---
-        async function apiCall(action, params = {}) {
-            if (!state.google_token) {
-                showNotification('Błąd: Brak tokenu uwierzytelniającego.', 'error');
-                logout();
-                return;
-            }
+  } catch (error) {
+      Logger.log(`Error in getQueriesForUser: ${error.toString()} Stack: ${error.stack}`);
+      logAction('Błąd w getQueriesForUser', 'System', 'getQueriesForUser', 'FUNCTION_ERROR', { error: error.toString() }, 'Błąd', error.stack);
+      // Przekaż błąd dalej, aby został obsłużony przez główny handler
+      throw error;
+  }
+}
 
-            const url = new URL(SCRIPT_URL);
-            url.searchParams.append('action', action);
-            url.searchParams.append('token', state.google_token);
 
-            for (const key in params) {
-                url.searchParams.append(key, params[key]);
-            }
-            
-            ui.loadingScreen.classList.remove('hidden');
-            try {
-                const response = await fetch(url);
-                if(response.status === 403 || response.status === 401){
-                   throw new Error('Brak autoryzacji. Zaloguj się ponownie.');
-                }
-                const result = await response.json();
-
-                if (result.error) {
-                    throw new Error(result.error);
-                }
-                return result.data;
-            } catch (error) {
-                console.error('API Call failed:', error);
-                showNotification(`Błąd: ${error.message}`, 'error');
-                logout();
-            } finally {
-                ui.loadingScreen.classList.add('hidden');
-            }
-        }
-        
-        async function initializeApp(token) {
-            state.google_token = token;
-            localStorage.setItem('google_token', token);
-
-            showScreen(ui.loadingScreen);
-
-            const data = await apiCall('getUserData');
-            if (data) {
-                state.user = data.user;
-                state.queries = data.queries;
-                
-                ui.userEmail.textContent = state.user.email;
-                setupUIForRole(state.user.role);
-                renderQueries();
-                showScreen(ui.mainApp);
-            } else {
-                // apiCall obsłuży błąd i wylogowanie
-            }
-        }
-
-        // --- OBSŁUGA LOGOWANIA ---
-        window.handleCredentialResponse = function(response) {
-            initializeApp(response.credential);
-        }
-
-        function logout() {
-            state.user = null;
-            state.queries = [];
-            state.google_token = null;
-            localStorage.removeItem('google_token');
-            // Wywołuje odnowienie sesji Google, aby upewnić się, że wylogowanie jest kompletne
-            google.accounts.id.disableAutoSelect();
-            showScreen(ui.loginScreen);
-        }
-
-        // --- INICJALIZACJA ---
-        document.addEventListener('DOMContentLoaded', () => {
-            const storedToken = localStorage.getItem('google_token');
-            if (storedToken) {
-                initializeApp(storedToken);
-            } else {
-                showScreen(ui.loginScreen);
-            }
-
-            ui.logoutButton.addEventListener('click', logout);
-        });
-
-        function showNotification(message, type = 'info') {
-            const notification = document.createElement('div');
-            notification.className = `fixed top-5 right-5 p-4 rounded-lg shadow-lg text-white ${type === 'error' ? 'bg-red-500' : 'bg-blue-500'}`;
-            notification.textContent = message;
-            document.body.appendChild(notification);
-            setTimeout(() => {
-                notification.remove();
-            }, 5000);
-        }
-    </script>
-
-</body>
-</html>
+function getAllUsers() {
+    const usersSheet = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID).getSheetByName(CONFIG.SHEET_NAMES.USERS);
+    if (!usersSheet) return [];
+    const data = usersSheet.getDataRange().getValues();
+    return data.slice(1).map(row => ({ email: row[0], role: row[1] })).filter(u => u.email); // filtruj puste wiersze
+}
